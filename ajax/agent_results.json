@@ -1,0 +1,1 @@
+{"results":[{"time":"2026-07-18 15:28:12","job":{"action":"scan_network","data":{"subnet":"192.168.1.0\/24"},"added":"2026-07-18 15:28:06"},"result":{"success":true,"message":"Job executed","job":{"action":"scan_network","data":{"subnet":"192.168.1.0\/24"},"added":"2026-07-18 15:28:06"}}}]}

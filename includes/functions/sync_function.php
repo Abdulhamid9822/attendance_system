@@ -1,0 +1,1195 @@
+<?php
+/**
+ * sync_functions.php - IVMS dan SalarySystem ga sinxronizatsiya
+ * Bir kunda 1 ta IN (eng erta) va 1 ta OUT (eng kech)
+ * Log fayllar 1000 qatordan oshmaydi
+ * account_name xodimlar jadvalidan olinadi
+ * DEFAULT QIYMATLARSIZ
+ * TUNGI SMENA (masalan 23:00 - 06:00) to'g'ri hisoblanadi
+ */
+
+// ============================================================
+// LOG FAYL YO'LLARI
+// ============================================================
+$logDir = dirname(__DIR__, 2) . '/logs';
+if (!is_dir($logDir)) {
+    mkdir($logDir, 0777, true);
+}
+
+$syncLogFile = $logDir . '/sync.log';
+$fullLogFile = $logDir . '/full_sync.log';
+$errorLogFile = $logDir . '/error.log';
+
+// ============================================================
+// LOG FUNKSIYALARI
+// ============================================================
+function writeLogFile($file, $msg) {
+    if (empty($file)) return;
+    $dir = dirname($file);
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0777, true);
+    }
+    $log = date('Y-m-d H:i:s') . " | $msg\n";
+    @file_put_contents($file, $log, FILE_APPEND | LOCK_EX);
+    truncateLogFile($file, 1000);
+}
+
+function truncateLogFile($file, $maxLines = 1000) {
+    if (!file_exists($file)) return;
+    try {
+        if (filesize($file) < 1024 * 1024) return;
+        $lines = file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        if ($lines === false) return;
+        $lineCount = count($lines);
+        if ($lineCount > $maxLines) {
+            $keepLines = array_slice($lines, -$maxLines);
+            file_put_contents($file, implode("\n", $keepLines) . "\n", LOCK_EX);
+        }
+    } catch (Exception $e) {}
+}
+
+function logError($msg) {
+    global $errorLogFile;
+    writeLogFile($errorLogFile, "❌ " . $msg);
+}
+
+function logInfo($msg) {
+    global $syncLogFile;
+    writeLogFile($syncLogFile, "ℹ️ " . $msg);
+}
+
+function logSuccess($msg) {
+    global $syncLogFile;
+    writeLogFile($syncLogFile, "✅ " . $msg);
+}
+
+// ============================================================
+// 0. TUNGI SMENA ANIQLASH
+// ============================================================
+function isNightShift($work_start, $work_end) {
+    if (empty($work_start) || empty($work_end)) return false;
+    $start_ts = strtotime($work_start);
+    $end_ts = strtotime($work_end);
+    if ($start_ts === false || $end_ts === false) return false;
+    return $start_ts > $end_ts;
+}
+
+// ============================================================
+// 0.1 DIRECTION NI VAQTGA QARAB ANIQLASH (YANGI)
+// ============================================================
+function getDirectionBySchedule($auth_time, $employee_id, $pdo_salary) {
+    // Xodimning sozlamasini olamiz
+    $monthlySettings = getMonthlySettings($pdo_salary, $employee_id);
+    
+    if ($monthlySettings === null) {
+        // Agar sozlama bo'lmasa, vaqtga qarab aniqlaymiz
+        $hour = (int)date('H', strtotime($auth_time));
+        if ($hour >= 6 && $hour < 12) {
+            return 'in';
+        } else {
+            return 'out';
+        }
+    }
+    
+    $work_start = $monthlySettings['ishga_kelish_vaqti'] ?? '09:00:00';
+    $work_end = $monthlySettings['ishdan_ketish_vaqti'] ?? '18:00:00';
+    
+    $hour = (int)date('H', strtotime($auth_time));
+    $minute = (int)date('i', strtotime($auth_time));
+    $time_decimal = $hour + ($minute / 60);
+    
+    $start_hour = (int)substr($work_start, 0, 2);
+    $start_minute = (int)substr($work_start, 3, 2);
+    $start_decimal = $start_hour + ($start_minute / 60);
+    
+    $end_hour = (int)substr($work_end, 0, 2);
+    $end_minute = (int)substr($work_end, 3, 2);
+    $end_decimal = $end_hour + ($end_minute / 60);
+    
+    // Tungi smena tekshiruvi
+    $isNight = $start_decimal > $end_decimal;
+    
+    if ($isNight) {
+        // TUNGI SMENA (masalan 23:00 - 06:00)
+        if ($time_decimal >= $start_decimal || $time_decimal < $end_decimal) {
+            return 'in';
+        } else {
+            return 'out';
+        }
+    } else {
+        // KUNDUZGI SMENA (masalan 09:00 - 21:00)
+        // Ertalab 06:00-12:00 -> IN (kelish)
+        if ($time_decimal >= 6 && $time_decimal < 12) {
+            return 'in';
+        }
+        // Kechqurun 18:00-02:00 -> OUT (ketish)
+        elseif ($time_decimal >= 18 || $time_decimal < 2) {
+            return 'out';
+        }
+        // Qolgan vaqt -> sozlamaga qarab
+        else {
+            if ($time_decimal >= $start_decimal - 1 && $time_decimal < $start_decimal + 2) {
+                return 'in';
+            } elseif ($time_decimal >= $end_decimal - 2 && $time_decimal < $end_decimal + 1) {
+                return 'out';
+            } else {
+                return ($time_decimal < 12) ? 'in' : 'out';
+            }
+        }
+    }
+}
+
+// ============================================================
+// 0.2 JORIY OYDA NECHTA XODIM TUNGI/KUNDUZGI SMENADA ISHLASHINI
+// ============================================================
+function logShiftTypeStats($pdo) {
+    try {
+        $currentMonth = date('Y-m-01');
+        
+        $stmt = $pdo->prepare("
+            SELECT 
+                os.xodim_id,
+                os.ishga_kelish_vaqti,
+                os.ishdan_ketish_vaqti,
+                x.ismi
+            FROM oylik_sozlamalar os
+            LEFT JOIN xodimlar x ON x.id = os.xodim_id
+            WHERE os.oy_vaqt = ?
+        ");
+        $stmt->execute([$currentMonth]);
+        $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        
+        $nightShiftEmployees = [];
+        $dayShiftEmployees = [];
+        $noScheduleCount = 0;
+        
+        foreach ($rows as $row) {
+            $work_start = $row['ishga_kelish_vaqti'] ?? null;
+            $work_end = $row['ishdan_ketish_vaqti'] ?? null;
+            
+            if (empty($work_start) || empty($work_end)) {
+                $noScheduleCount++;
+                continue;
+            }
+            
+            if (isNightShift($work_start, $work_end)) {
+                $nightShiftEmployees[] = [
+                    'id' => $row['xodim_id'],
+                    'ismi' => $row['ismi'] ?? '(nomsiz)',
+                    'vaqt' => $work_start . ' - ' . $work_end
+                ];
+            } else {
+                $dayShiftEmployees[] = [
+                    'id' => $row['xodim_id'],
+                    'ismi' => $row['ismi'] ?? '(nomsiz)',
+                    'vaqt' => $work_start . ' - ' . $work_end
+                ];
+            }
+        }
+        
+        $nightCount = count($nightShiftEmployees);
+        $dayCount = count($dayShiftEmployees);
+        $totalCount = count($rows);
+        
+        logInfo("📊 SMENA STATISTIKASI ({$currentMonth}): Jami={$totalCount}, Tungi smena={$nightCount}, Kunduzgi smena={$dayCount}, Sozlamasiz={$noScheduleCount}");
+        
+        if ($nightCount > 0) {
+            foreach ($nightShiftEmployees as $emp) {
+                logInfo("🌙 Tungi smena xodimi: ID={$emp['id']}, Ismi={$emp['ismi']}, Vaqt={$emp['vaqt']}");
+            }
+        } else {
+            logInfo("🌙 Tungi smenada ishlaydigan xodim yo'q");
+        }
+        
+        return [
+            'total' => $totalCount,
+            'night_shift_count' => $nightCount,
+            'day_shift_count' => $dayCount,
+            'no_schedule_count' => $noScheduleCount,
+            'night_shift_employees' => $nightShiftEmployees,
+            'day_shift_employees' => $dayShiftEmployees
+        ];
+        
+    } catch (Exception $e) {
+        logError("Smena statistikasini hisoblash xatosi: " . $e->getMessage());
+        return [
+            'total' => 0,
+            'night_shift_count' => 0,
+            'day_shift_count' => 0,
+            'no_schedule_count' => 0,
+            'night_shift_employees' => [],
+            'day_shift_employees' => []
+        ];
+    }
+}
+
+// ============================================================
+// 0.3 YARIM TUNNI KESIB O'TGAN IN/OUT JUFTINI BIRLASHTIRISH
+// Smena turidan (tungi/kunduzgi) qat'i nazar ishlaydi: agar xodimning
+// biror kunda OCHIQ IN yozuvi bo'lsa (out yo'q) va ertasi kuni ertalab
+// (00:00-11:59) OUT kelsa hamda ular orasidagi farq oqilona bo'lsa
+// (max_gap_hours dan oshmasa), bu ikkalasi HAQIQIY vaqt bilan bitta
+// yozuvga birlashtiriladi — taxminiy emas, qattiy nazar bilan.
+// ============================================================
+function mergeMidnightCrossingGroups(&$dailyGroups, $employee_id, $employeeShiftMap) {
+    $byDate = [];
+    foreach ($dailyGroups as $key => $data) {
+        $byDate[$data['auth_date']] = $key;
+    }
+    if (count($byDate) < 2) {
+        return;
+    }
+
+    $dates = array_keys($byDate);
+    sort($dates);
+
+    $maxGapHours = $employeeShiftMap[$employee_id]['max_gap_hours'] ?? 20;
+
+    foreach ($dates as $date) {
+        if (!isset($byDate[$date])) continue;
+        $key = $byDate[$date];
+        if (!isset($dailyGroups[$key])) continue;
+        $group = $dailyGroups[$key];
+
+        // Faqat OCHIQ IN (out yo'q) holatlar tekshiriladi
+        if ($group['in_time'] === null || $group['out_time'] !== null) {
+            continue;
+        }
+
+        $nextDate = date('Y-m-d', strtotime($date . ' +1 day'));
+        if (!isset($byDate[$nextDate])) continue;
+        $nextKey = $byDate[$nextDate];
+        if (!isset($dailyGroups[$nextKey])) continue;
+        $nextGroup = $dailyGroups[$nextKey];
+
+        // Keyingi kun faqat OUT bo'lishi kerak (IN bo'lmasligi kerak)
+        if ($nextGroup['in_time'] !== null || $nextGroup['out_time'] === null) {
+            continue;
+        }
+
+        $outHour = (int)date('H', strtotime($nextGroup['out_time']));
+        if ($outHour >= 12) {
+            // Bu kunduzgi OUT, oldingi kun bilan aloqasi yo'q deb hisoblanadi
+            continue;
+        }
+
+        if (empty($group['in_datetime']) || empty($nextGroup['out_datetime'])) {
+            continue;
+        }
+
+        $inTs = strtotime($group['in_datetime']);
+        $outTs = strtotime($nextGroup['out_datetime']);
+        if ($inTs === false || $outTs === false || $outTs <= $inTs) {
+            continue;
+        }
+
+        $gapHours = ($outTs - $inTs) / 3600;
+
+        if ($maxGapHours !== null && $gapHours > $maxGapHours) {
+            // Juda uzoq farq — ehtimol bog'liq emas, alohida qoldiriladi
+            continue;
+        }
+
+        // BIRLASHTIRISH: haqiqiy OUT vaqti ochiq IN kuniga ko'chiriladi
+        $dailyGroups[$key]['out_time'] = $nextGroup['out_time'];
+        $dailyGroups[$key]['out_datetime'] = $nextGroup['out_datetime'];
+        $dailyGroups[$key]['out_device'] = $nextGroup['out_device'];
+        $dailyGroups[$key]['ids'] = array_merge($dailyGroups[$key]['ids'], $nextGroup['ids']);
+
+        logInfo("🌙 Yarim tunni kesib o'tgan IN/OUT birlashtirildi: employee={$employee_id}, IN={$date} {$group['in_time']}, OUT={$nextDate} {$nextGroup['out_time']}, farq=" . round($gapHours, 2) . " soat");
+
+        unset($dailyGroups[$nextKey]);
+        unset($byDate[$nextDate]);
+    }
+}
+
+// ============================================================
+// 1. XODIM MA'LUMOTLARINI OLISH
+// ============================================================
+function getEmployeeSettings($pdo, $employee_id) {
+    try {
+        $stmt = $pdo->prepare("
+            SELECT id, ismi, account_name, poster_id, holati
+            FROM xodimlar 
+            WHERE id = ? AND holati = 'active'
+            LIMIT 1
+        ");
+        $stmt->execute([$employee_id]);
+        $result = $stmt->fetch(PDO::FETCH_ASSOC);
+        if ($result) return $result;
+        
+        $stmt = $pdo->prepare("
+            SELECT id, ismi, account_name, poster_id, holati
+            FROM xodimlar 
+            WHERE poster_id = ? AND holati = 'active'
+              AND (SELECT COUNT(*) FROM xodimlar x2 WHERE x2.poster_id = xodimlar.poster_id AND x2.holati = 'active') = 1
+            LIMIT 1
+        ");
+        $stmt->execute([$employee_id]);
+        $result = $stmt->fetch(PDO::FETCH_ASSOC);
+        if ($result) return $result;
+        
+        return null;
+    } catch (Exception $e) {
+        logError("Xodim ma'lumotlarini olish xatosi (ID: $employee_id): " . $e->getMessage());
+        return null;
+    }
+}
+
+// ============================================================
+// 2. OYLIK SOZLAMALARNI OLISH (amal_qiladi ni hisobga oladi)
+// MySQL 8.0 NO_ZERO_DATE bilan mos: '0000-00-00' literali olib tashlandi.
+// amal_qiladi ustuni jadvalda NOT NULL DEFAULT '2024-01-01' bo'lgani uchun
+// (ya'ni hech qachon NULL bo'lmaydi), IS NULL tekshiruvlari ham olib tashlandi.
+// ============================================================
+function getMonthlySettings($pdo, $employee_id, $workDate = null)
+{
+    try {
+        if (empty($workDate)) {
+            $workDate = date('Y-m-d');
+        }
+        $currentMonth = date('Y-m-01', strtotime($workDate));
+
+        $stmt = $pdo->prepare("
+            SELECT
+                id,
+                xodim_id,
+                oy_vaqt,
+                oylik_maosh,
+                maosh_turi,
+                foiz_qiymati,
+                poster_user_id,
+                amal_qiladi,
+                ishlagan_kun,
+                hisoblangan_maosh,
+                bonus,
+                jarima,
+                qarzdorlik,
+                oldingi_oy_balansi,
+                keyingi_oyga_balansi,
+                created_at,
+                updated_at,
+                soatlik_stavka,
+                ishga_kelish_vaqti,
+                ishdan_ketish_vaqti,
+                tushlik_boshlanish,
+                tushlik_tugash,
+                erta_kelish_bonus_enabled,
+                erta_kelish_bonus_amount,
+                erta_kelish_max_bonus,
+                kech_ketish_bonus_enabled,
+                kech_ketish_bonus_amount,
+                kech_ketish_max_bonus,
+                kech_kelish_jarima_enabled,
+                kech_kelish_jarima_per_minute,
+                kech_kelish_max_jarima,
+                erta_ketish_jarima_enabled,
+                erta_ketish_jarima_per_minute,
+                erta_ketish_max_jarima,
+                kech_kelish_grace_minutes,
+                erta_ketish_grace_minutes
+            FROM oylik_sozlamalar
+            WHERE
+                xodim_id = ?
+                AND oy_vaqt = ?
+                AND amal_qiladi <= ?
+            ORDER BY
+                amal_qiladi DESC,
+                id DESC
+            LIMIT 1
+        ");
+
+        $stmt->execute([$employee_id, $currentMonth, $workDate]);
+        $result = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if ($result) {
+            logInfo("✅ Oylik sozlama topildi: employee={$employee_id}, amal_qiladi={$result['amal_qiladi']}, ishga_kelish={$result['ishga_kelish_vaqti']}, ishdan_ketish={$result['ishdan_ketish_vaqti']}");
+            return $result;
+        }
+
+        logInfo("ℹ️ Oylik sozlama topilmadi: employee={$employee_id}, sana={$workDate}");
+        return null;
+
+    } catch (Exception $e) {
+        logError("Oylik sozlamalarni olish xatosi: " . $e->getMessage());
+        return null;
+    }
+}
+
+// ============================================================
+// 3. IN VAQTI HISOBI
+// ============================================================
+function calculateInMinutes($in_time, $monthlySettings) {
+    if (empty($in_time) || empty($monthlySettings)) {
+        return 0;
+    }
+    
+    try {
+        if (empty($monthlySettings['ishga_kelish_vaqti'])) {
+            return 0;
+        }
+        
+        $work_start = $monthlySettings['ishga_kelish_vaqti'];
+        $grace_minutes = isset($monthlySettings['kech_kelish_grace_minutes']) ? (int)$monthlySettings['kech_kelish_grace_minutes'] : 0;
+        
+        $in_ts = strtotime($in_time);
+        $start_ts = strtotime($work_start);
+        
+        if ($in_ts > $start_ts) {
+            $diff = floor(($in_ts - $start_ts) / 60);
+            $diff = max(0, $diff - $grace_minutes);
+            return $diff;
+        } elseif ($in_ts < $start_ts) {
+            return -floor(($start_ts - $in_ts) / 60);
+        }
+        return 0;
+    } catch (Exception $e) {
+        logError("IN vaqtini hisoblash xatosi: " . $e->getMessage());
+        return 0;
+    }
+}
+
+// ============================================================
+// 4. OUT VAQTI HISOBI
+// ============================================================
+function calculateOutMinutes($out_time, $auth_date, $monthlySettings) {
+    if (empty($out_time) || empty($monthlySettings)) {
+        return 0;
+    }
+    
+    try {
+        if (empty($monthlySettings['ishdan_ketish_vaqti'])) {
+            return 0;
+        }
+        
+        $work_start = $monthlySettings['ishga_kelish_vaqti'] ?? null;
+        $work_end = $monthlySettings['ishdan_ketish_vaqti'];
+        
+        $out_ts = strtotime($out_time);
+        $end_ts = strtotime($work_end);
+        
+        // FARQNI HISOBLASH (ijobiy -> kech ketish, manfiy -> erta ketish)
+        $diff_minutes = floor(($out_ts - $end_ts) / 60);
+        
+        // Grace ni hisobga olamiz
+        $grace_minutes = isset($monthlySettings['erta_ketish_grace_minutes']) 
+            ? (int)$monthlySettings['erta_ketish_grace_minutes'] 
+            : 0;
+        
+        if ($diff_minutes > 0) {
+            // Kech ketish -> bonus
+            $diff_minutes = max(0, $diff_minutes - $grace_minutes);
+            logInfo("✅ KECH KETISH: out={$out_time}, end={$work_end}, diff={$diff_minutes} min (BONUS)");
+        } elseif ($diff_minutes < 0) {
+            // Erta ketish -> jarima
+            $diff_minutes = min(0, $diff_minutes + $grace_minutes);
+            logInfo("✅ ERTA KETISH: out={$out_time}, end={$work_end}, diff={$diff_minutes} min (JARIMA)");
+        }
+        
+        return $diff_minutes;
+        
+    } catch (Exception $e) {
+        logError("OUT vaqtini hisoblash xatosi: " . $e->getMessage());
+        return 0;
+    }
+}
+
+// ============================================================
+// 5. ISH VAQTINI HISOBLASH
+// ============================================================
+function calculateWorkHours($in_datetime, $out_datetime, $auth_date, $monthlySettings) {
+    if (empty($in_datetime) || empty($out_datetime)) return 0;
+    try {
+        $in_ts = strtotime($in_datetime);
+        $out_ts = strtotime($out_datetime);
+        
+        if ($out_ts <= $in_ts) {
+            $out_ts = strtotime('+1 day', $out_ts);
+        }
+        
+        if ($out_ts <= $in_ts) return 0;
+        
+        $total_seconds = $out_ts - $in_ts;
+        
+        if (!empty($monthlySettings) && 
+            !empty($monthlySettings['tushlik_boshlanish']) && 
+            !empty($monthlySettings['tushlik_tugash'])) {
+            
+            $lunch_start = strtotime($auth_date . ' ' . $monthlySettings['tushlik_boshlanish']);
+            $lunch_end = strtotime($auth_date . ' ' . $monthlySettings['tushlik_tugash']);
+            
+            if ($lunch_start !== false && $lunch_end !== false &&
+                $in_ts <= $lunch_start && $out_ts >= $lunch_end) {
+                $total_seconds -= ($lunch_end - $lunch_start);
+            }
+        }
+        
+        return round(max(0, $total_seconds) / 3600, 2);
+    } catch (Exception $e) {
+        logError("Ish vaqtini hisoblash xatosi: " . $e->getMessage());
+        return 0;
+    }
+}
+
+// ============================================================
+// 6. YOZUVNI SAQLASH
+// ============================================================
+function saveOrUpdateAttendance($pdo, $data, $account_name) {
+    try {
+        $monthlySettings = getMonthlySettings($pdo, $data['employee_id']);
+        
+        $work_start_setting = $monthlySettings['ishga_kelish_vaqti'] ?? null;
+        $work_end_setting = $monthlySettings['ishdan_ketish_vaqti'] ?? null;
+        $nightShift = isNightShift($work_start_setting, $work_end_setting);
+        
+        // OCHIQ IN YOZUVNI TOPISH
+        $stmt = $pdo->prepare("
+            SELECT 
+                id, employee_id, auth_date,
+                in_datetime, in_time, in_device, in_late_minutes,
+                out_time, out_datetime, out_early_minutes, total_work_hours
+            FROM attendance_data 
+            WHERE employee_id = ? 
+                AND account_name = ?
+                AND out_time IS NULL
+                AND in_time IS NOT NULL
+            ORDER BY auth_date ASC, in_time ASC
+            LIMIT 1
+        ");
+        $stmt->execute([$data['employee_id'], $account_name]);
+        $openRecord = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        // MAVJUD YOZUVNI TEKSHIRISH
+        $stmt = $pdo->prepare("
+            SELECT 
+                id, 
+                in_time, in_datetime, in_device, in_late_minutes,
+                out_time, out_datetime, out_device, out_early_minutes,
+                total_work_hours
+            FROM attendance_data 
+            WHERE employee_id = ? 
+                AND account_name = ?
+                AND auth_date = ?
+            LIMIT 1
+        ");
+        $stmt->execute([$data['employee_id'], $account_name, $data['auth_date']]);
+        $existing = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        // OCHIQ IN NI AVTOMATIK YOPISH
+        if ($openRecord && !empty($data['in_time']) && $openRecord['auth_date'] != $data['auth_date']) {
+            logInfo("🔍 Ochiq IN topildi (avtomatik yopiladi): ID={$openRecord['id']}, date={$openRecord['auth_date']}");
+            
+            $work_end = null;
+            if ($monthlySettings && !empty($monthlySettings['ishdan_ketish_vaqti'])) {
+                $work_end = $monthlySettings['ishdan_ketish_vaqti'];
+            }
+            
+            if ($work_end !== null) {
+                $auto_out_datetime = $openRecord['auth_date'] . ' ' . $work_end;
+                $auto_out_time = $work_end;
+                
+                if (!empty($openRecord['in_datetime']) &&
+                    strtotime($auto_out_datetime) <= strtotime($openRecord['in_datetime'])) {
+                    $auto_out_datetime = date('Y-m-d H:i:s', strtotime($auto_out_datetime . ' +1 day'));
+                }
+                
+                $out_early_minutes = 0;
+                if ($monthlySettings !== null) {
+                    $out_early_minutes = calculateOutMinutes($auto_out_time, $openRecord['auth_date'], $monthlySettings);
+                }
+                
+                $total_hours = 0;
+                if ($monthlySettings !== null && !empty($openRecord['in_datetime'])) {
+                    $total_hours = calculateWorkHours($openRecord['in_datetime'], $auto_out_datetime, $openRecord['auth_date'], $monthlySettings);
+                }
+                
+                $stmt = $pdo->prepare("
+                    UPDATE attendance_data 
+                    SET 
+                        out_time = ?,
+                        out_datetime = ?,
+                        out_device = ?,
+                        out_early_minutes = ?,
+                        total_work_hours = ?,
+                        updated_at = NOW()
+                    WHERE id = ?
+                ");
+                
+                $stmt->execute([
+                    $auto_out_time,
+                    $auto_out_datetime,
+                    'auto_close',
+                    $out_early_minutes,
+                    $total_hours,
+                    $openRecord['id']
+                ]);
+                
+                logSuccess("✅ Ochiq IN avtomatik yopildi: ID={$openRecord['id']}, OUT vaqti={$work_end}");
+            }
+        }
+        
+        // MAVJUD YOZUVNI YANGILASH
+        if ($existing) {
+            logInfo("📝 Mavjud yozuv topildi: ID={$existing['id']}, date={$data['auth_date']}");
+            
+            $updates = [];
+            $params = [];
+            $hasUpdate = false;
+            
+            // IN yangilash
+            if (!empty($data['in_time'])) {
+                $shouldUpdateIn = ($existing['in_time'] === null);
+                if (!$shouldUpdateIn && !empty($existing['in_datetime']) && !empty($data['in_datetime'])) {
+                    $shouldUpdateIn = strtotime($data['in_datetime']) < strtotime($existing['in_datetime']);
+                }
+                
+                if ($shouldUpdateIn) {
+                    $in_late_minutes = 0;
+                    if ($monthlySettings !== null) {
+                        $in_late_minutes = calculateInMinutes($data['in_time'], $monthlySettings);
+                    }
+                    
+                    $updates[] = "in_time = ?";
+                    $params[] = $data['in_time'];
+                    $updates[] = "in_datetime = ?";
+                    $params[] = $data['in_datetime'];
+                    $updates[] = "in_device = ?";
+                    $params[] = $data['in_device'] ?? null;
+                    $updates[] = "in_late_minutes = ?";
+                    $params[] = $in_late_minutes;
+                    $hasUpdate = true;
+                    
+                    logInfo("🔄 IN yangilandi: {$data['in_time']}");
+                }
+            }
+            
+            // OUT yangilash
+            if (!empty($data['out_time'])) {
+                $shouldUpdateOut = ($existing['out_time'] === null);
+                if (!$shouldUpdateOut) {
+                    if (!empty($existing['out_datetime']) && !empty($data['out_datetime'])) {
+                        $shouldUpdateOut = strtotime($data['out_datetime']) > strtotime($existing['out_datetime']);
+                    } else {
+                        $shouldUpdateOut = $data['out_time'] > $existing['out_time'];
+                    }
+                }
+                
+                if ($shouldUpdateOut) {
+                    $out_early_minutes = 0;
+                    $total_hours = 0;
+                    
+                    if ($monthlySettings !== null) {
+                        $out_early_minutes = calculateOutMinutes($data['out_time'], $data['auth_date'], $monthlySettings);
+                        
+                        $in_datetime = !empty($updates) && !empty($data['in_datetime']) ? $data['in_datetime'] : $existing['in_datetime'];
+                        if (!empty($in_datetime)) {
+                            $total_hours = calculateWorkHours($in_datetime, $data['out_datetime'], $data['auth_date'], $monthlySettings);
+                        }
+                    }
+                    
+                    $updates[] = "out_time = ?";
+                    $params[] = $data['out_time'];
+                    $updates[] = "out_datetime = ?";
+                    $params[] = $data['out_datetime'];
+                    $updates[] = "out_device = ?";
+                    $params[] = $data['out_device'] ?? null;
+                    $updates[] = "out_early_minutes = ?";
+                    $params[] = $out_early_minutes;
+                    $updates[] = "total_work_hours = ?";
+                    $params[] = $total_hours;
+                    $hasUpdate = true;
+                    
+                    logInfo("🔄 OUT yangilandi: {$data['out_time']}");
+                }
+            }
+            
+            if (!$hasUpdate) {
+                logInfo("ℹ️ Yangilash uchun ma'lumot yo'q");
+                return true;
+            }
+            
+            $updates[] = "updated_at = NOW()";
+            $sql = "UPDATE attendance_data SET " . implode(", ", $updates) . " WHERE id = ?";
+            $params[] = $existing['id'];
+            
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute($params);
+            
+            logSuccess("✅ Yozuv yangilandi: ID={$existing['id']}");
+            return true;
+        }
+        
+        // YANGI YOZUV YARATISH
+        logInfo("🆕 Yangi yozuv yaratilmoqda: employee={$data['employee_id']}, date={$data['auth_date']}" . ($nightShift ? " [TUNGI SMENA]" : ""));
+        
+        $in_late_minutes = 0;
+        $in_status = '';
+        if (!empty($data['in_time']) && $monthlySettings !== null) {
+            $in_late_minutes = calculateInMinutes($data['in_time'], $monthlySettings);
+            
+            if ($in_late_minutes > 0) {
+                $in_status = "kechikish: {$in_late_minutes} min";
+            } elseif ($in_late_minutes < 0) {
+                $in_status = "erta kelish: " . abs($in_late_minutes) . " min";
+            } else {
+                $in_status = "vaqtida";
+            }
+        }
+        
+        $out_early_minutes = 0;
+        $total_hours = 0;
+        $out_status = '';
+        
+        if (!empty($data['out_time']) && $monthlySettings !== null) {
+            $out_early_minutes = calculateOutMinutes($data['out_time'], $data['auth_date'], $monthlySettings);
+            
+            if ($out_early_minutes > 0) {
+                $out_status = "kech ketish: {$out_early_minutes} min (BONUS)";
+            } elseif ($out_early_minutes < 0) {
+                $out_status = "erta ketish: " . abs($out_early_minutes) . " min (JARIMA)";
+            } else {
+                $out_status = "vaqtida";
+            }
+            
+            if (!empty($data['in_datetime'])) {
+                $total_hours = calculateWorkHours($data['in_datetime'], $data['out_datetime'], $data['auth_date'], $monthlySettings);
+            }
+        } else {
+            $out_status = "kutilmoqda";
+        }
+        
+        $stmt = $pdo->prepare("
+            INSERT INTO attendance_data (
+                employee_id, account_name, auth_date,
+                in_time, in_datetime, in_device, in_late_minutes,
+                out_time, out_datetime, out_device, out_early_minutes,
+                total_work_hours,
+                created_at, updated_at
+            ) VALUES (
+                ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?,
+                NOW(), NOW()
+            )
+        ");
+        
+        $stmt->execute([
+            $data['employee_id'],
+            $account_name,
+            $data['auth_date'],
+            $data['in_time'],
+            $data['in_datetime'],
+            $data['in_device'] ?? null,
+            $in_late_minutes,
+            $data['out_time'],
+            $data['out_datetime'],
+            $data['out_device'] ?? null,
+            $out_early_minutes,
+            $total_hours
+        ]);
+        
+        $new_id = $pdo->lastInsertId();
+        
+        $status_msg = "IN: {$in_status}";
+        if (!empty($data['out_time'])) {
+            $status_msg .= ", OUT: {$out_status}";
+        } else {
+            $status_msg .= ", OUT: kutilmoqda";
+        }
+        
+        logSuccess("➕ Yangi yozuv qo'shildi: ID={$new_id}, {$status_msg}");
+        return true;
+        
+    } catch (Exception $e) {
+        logError("❌ Yozuvni saqlash xatosi: " . $e->getMessage());
+        logError("❌ Stack trace: " . $e->getTraceAsString());
+        return false;
+    }
+}
+
+// ============================================================
+// 7. ASOSIY SINXRONIZATSIYA FUNKSIYASI
+// ============================================================
+function syncAttendanceData() {
+    global $syncLogFile, $fullLogFile;
+    
+    $host = getenv('IVMS_HOST');
+    $username = getenv('IVMS_USER');
+    $password = getenv('IVMS_PASS');
+    $salaryHost = getenv('DB_HOST');
+    $salaryUsername = getenv('DB_USER');
+    $salaryPassword = getenv('DB_PASS');
+    $salaryDatabase = getenv('DB_NAME');
+    
+    $startTime = microtime(true);
+    $stats = [
+        'read' => 0,
+        'grouped' => 0,
+        'inserted' => 0,
+        'updated' => 0,
+        'errors' => 0,
+        'synced' => 0,
+        'skipped' => 0
+    ];
+    
+    try {
+        $pdo_ivms = new PDO(
+            "mysql:host=$host;dbname=ivms;charset=utf8mb4",
+            $username,
+            $password,
+            [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
+        );
+        
+        $pdo_salary = new PDO(
+            "mysql:host=$salaryHost;dbname=$salaryDatabase;charset=utf8mb4",
+            $salaryUsername,
+            $salaryPassword,
+            [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
+        );
+        
+        logInfo("🔄 SYNC STARTED");
+        
+        $shiftStats = logShiftTypeStats($pdo_salary);
+        
+        // IVMS da synced ustuni
+        try {
+            $check = $pdo_ivms->query("SHOW COLUMNS FROM attendance_data LIKE 'synced'");
+            if ($check->rowCount() == 0) {
+                $pdo_ivms->exec("ALTER TABLE attendance_data ADD COLUMN synced TINYINT(1) DEFAULT 0");
+                $pdo_ivms->exec("ALTER TABLE attendance_data ADD COLUMN synced_at DATETIME NULL");
+                logSuccess("✅ IVMS ga synced ustunlari qo'shildi");
+            }
+        } catch (Exception $e) {
+            logError("⚠️ synced ustunlarini tekshirish xatosi: " . $e->getMessage());
+        }
+        
+        // IVMS dan ma'lumotlarni olish
+        $query = "
+            SELECT 
+                id, employee_id, employee_name,
+                auth_date, auth_datetime, auth_time,
+                direction, device_name, davomat_holati
+            FROM attendance_data
+            WHERE (synced = 0 OR synced IS NULL)
+              AND auth_date >= CURDATE() - INTERVAL 30 DAY
+              AND employee_id IS NOT NULL
+              AND employee_id != '' AND employee_id != '0'
+            ORDER BY employee_id, auth_date, auth_time ASC
+            LIMIT 5000
+        ";
+        
+        $records = $pdo_ivms->query($query)->fetchAll(PDO::FETCH_ASSOC);
+        $stats['read'] = count($records);
+        
+        if (empty($records)) {
+            logSuccess("ℹ️ Yangi ma'lumotlar yo'q");
+            return [
+                'status' => 'success',
+                'message' => 'No new records',
+                'stats' => $stats,
+                'shift_stats' => [
+                    'total' => $shiftStats['total'],
+                    'night_shift_count' => $shiftStats['night_shift_count'],
+                    'day_shift_count' => $shiftStats['day_shift_count'],
+                    'no_schedule_count' => $shiftStats['no_schedule_count']
+                ],
+                'timestamp' => date('Y-m-d H:i:s')
+            ];
+        }
+        
+        logInfo("📊 " . $stats['read'] . " ta yozuv o'qildi");
+        
+        // HAR BIR XODIM UCHUN SOZLAMALARNI OLDINDAN YUKLAB OLISH
+        $uniqueEmployeeIds = array_unique(array_column($records, 'employee_id'));
+        $employeeShiftMap = [];
+        
+        foreach ($uniqueEmployeeIds as $emp_id) {
+            $ms = getMonthlySettings($pdo_salary, $emp_id);
+            $maxGapHours = 18;
+            $nightFlag = false;
+            
+            if ($ms !== null && !empty($ms['ishga_kelish_vaqti']) && !empty($ms['ishdan_ketish_vaqti'])) {
+                $work_start = $ms['ishga_kelish_vaqti'];
+                $work_end = $ms['ishdan_ketish_vaqti'];
+                
+                $start_ts = strtotime($work_start);
+                $end_ts = strtotime($work_end);
+                
+                if ($end_ts <= $start_ts) {
+                    $shiftDurationHours = (($end_ts + 86400) - $start_ts) / 3600;
+                    $nightFlag = true;
+                } else {
+                    $shiftDurationHours = ($end_ts - $start_ts) / 3600;
+                    $nightFlag = false;
+                }
+                
+                if ($shiftDurationHours >= 20) {
+                    $maxGapHours = null;
+                } else {
+                    $maxGapHours = min(23, $shiftDurationHours + 3);
+                }
+            }
+            
+            $employeeShiftMap[$emp_id] = [
+                'max_gap_hours' => $maxGapHours,
+                'is_night' => $nightFlag
+            ];
+        }
+        
+        logInfo("📊 " . count($employeeShiftMap) . " ta xodim uchun smena jadvali yuklandi");
+        
+        // ============================================================
+        // IN va OUT LARNI GURUHLASH (YANGILANGAN)
+        // ============================================================
+        $grouped = [];
+        $byEmployee = [];
+        
+        foreach ($records as $r) {
+            $byEmployee[$r['employee_id']][] = $r;
+        }
+        
+        foreach ($byEmployee as $employee_id => $empRecords) {
+            $dailyGroups = [];
+            
+            foreach ($empRecords as $r) {
+                $ivms_direction = strtolower(trim($r['direction'] ?? ''));
+                $auth_date = $r['auth_date'];
+                $auth_time = $r['auth_time'];
+                $auth_datetime = $r['auth_datetime'];
+                
+                // Access Controller bo'lsa, vaqtga qarab aniqlaymiz
+                if (strpos($ivms_direction, 'access') !== false || 
+                    strpos($ivms_direction, 'controller') !== false) {
+                    $dir = getDirectionBySchedule($auth_time, $employee_id, $pdo_salary);
+                    logInfo("🔄 Access Controller ({$auth_time}) -> {$dir} deb belgilandi");
+                } else {
+                    $dir = $ivms_direction;
+                }
+                
+                // KUN bo'yicha guruhlash
+                $key = $employee_id . '|' . $auth_date;
+                
+                if (!isset($dailyGroups[$key])) {
+                    $dailyGroups[$key] = [
+                        'employee_id' => $employee_id,
+                        'employee_name' => $r['employee_name'] ?? null,
+                        'auth_date' => $auth_date,
+                        'in_time' => null,
+                        'in_datetime' => null,
+                        'in_device' => null,
+                        'out_time' => null,
+                        'out_datetime' => null,
+                        'out_device' => null,
+                        'ids' => []
+                    ];
+                }
+                
+                if ($dir == 'in') {
+                    // ENG ERTA IN
+                    if ($dailyGroups[$key]['in_time'] === null || 
+                        $auth_time < $dailyGroups[$key]['in_time']) {
+                        $dailyGroups[$key]['in_time'] = $auth_time;
+                        $dailyGroups[$key]['in_datetime'] = $auth_datetime;
+                        $dailyGroups[$key]['in_device'] = $r['device_name'] ?? null;
+                    }
+                    $dailyGroups[$key]['ids'][] = $r['id'];
+                    
+                } elseif ($dir == 'out') {
+                    // ENG KECH OUT
+                    if ($dailyGroups[$key]['out_datetime'] === null ||
+                        strtotime($auth_datetime) > strtotime($dailyGroups[$key]['out_datetime'])) {
+                        $dailyGroups[$key]['out_time'] = $auth_time;
+                        $dailyGroups[$key]['out_datetime'] = $auth_datetime;
+                        $dailyGroups[$key]['out_device'] = $r['device_name'] ?? null;
+                    }
+                    $dailyGroups[$key]['ids'][] = $r['id'];
+                }
+            }
+            
+            // Yarim tunni kesib o'tgan IN/OUT juftlarini birlashtirish
+            // (smena turidan qat'i nazar — kunduzgi xodim ham kech qolib
+            // yarim tundan keyin chiqib ketishi mumkin)
+            mergeMidnightCrossingGroups($dailyGroups, $employee_id, $employeeShiftMap);
+            
+            foreach ($dailyGroups as $key => $data) {
+                if ($data['in_time'] !== null || $data['out_time'] !== null) {
+                    $grouped[$key] = $data;
+                }
+            }
+        }
+        
+        $stats['grouped'] = count($grouped);
+        logInfo("📊 " . $stats['grouped'] . " ta kunlik yozuvga birlashtirildi");
+        
+        $total_in = 0;
+        $total_out = 0;
+        foreach ($grouped as $g) {
+            $total_in += $g['in_count'] ?? 1;
+            $total_out += $g['out_count'] ?? 1;
+        }
+        logInfo("📊 Jami IN: $total_in, Jami OUT: $total_out");
+        
+        $all_ids = [];
+        
+        foreach ($grouped as $key => $data) {
+            try {
+                $employee = getEmployeeSettings($pdo_salary, $data['employee_id']);
+                
+                if (!$employee) {
+                    logInfo("⏭️ Xodim topilmadi: employee_id={$data['employee_id']}");
+                    $stats['skipped']++;
+                    continue;
+                }
+                
+                $account_name = $employee['account_name'] ?? null;
+                
+                if (empty($account_name)) {
+                    logInfo("⏭️ Account name yo'q: employee_id={$data['employee_id']}");
+                    $stats['skipped']++;
+                    continue;
+                }
+                
+                $monthlySettings = getMonthlySettings($pdo_salary, $data['employee_id']);
+                
+                if ($monthlySettings === null) {
+                    logInfo("ℹ️ Oylik sozlama yo'q, faqat vaqt saqlanadi: employee={$data['employee_id']}");
+                }
+                
+                $saveData = [
+                    'employee_id' => $data['employee_id'],
+                    'auth_date' => $data['auth_date'],
+                    'in_time' => $data['in_time'],
+                    'in_datetime' => $data['in_datetime'],
+                    'in_device' => $data['in_device'],
+                    'out_time' => $data['out_time'],
+                    'out_datetime' => $data['out_datetime'],
+                    'out_device' => $data['out_device']
+                ];
+                
+                $log_msg = "employee={$data['employee_id']}, date={$data['auth_date']}";
+                if ($data['in_time']) {
+                    $log_msg .= ", IN={$data['in_time']} (eng erta)";
+                }
+                if ($data['out_time']) {
+                    $log_msg .= ", OUT={$data['out_time']} (eng kech)";
+                }
+                logInfo(" " . $log_msg);
+                
+                $success = saveOrUpdateAttendance($pdo_salary, $saveData, $account_name);
+                
+                if ($success) {
+                    $stats['inserted']++;
+                    foreach ($data['ids'] as $id) {
+                        $all_ids[] = $id;
+                    }
+                } else {
+                    $stats['errors']++;
+                }
+                
+            } catch (Exception $e) {
+                $stats['errors']++;
+                logError("❌ Xatolik (employee: {$data['employee_id']}): " . $e->getMessage());
+            }
+        }
+        
+        // IVMS da synced deb belgilash
+        if (!empty($all_ids)) {
+            $all_ids = array_unique(array_filter($all_ids));
+            $updated_sync = 0;
+            
+            $chunks = array_chunk($all_ids, 100);
+            foreach ($chunks as $chunk) {
+                try {
+                    $placeholders = implode(',', array_fill(0, count($chunk), '?'));
+                    $stmt = $pdo_ivms->prepare("
+                        UPDATE attendance_data 
+                        SET synced = 1, synced_at = NOW() 
+                        WHERE id IN ($placeholders)
+                    ");
+                    $stmt->execute($chunk);
+                    $updated_sync += count($chunk);
+                } catch (Exception $e) {
+                    logError("⚠️ Batch sync xatosi: " . $e->getMessage());
+                    foreach ($chunk as $id) {
+                        try {
+                            $stmt = $pdo_ivms->prepare("
+                                UPDATE attendance_data 
+                                SET synced = 1, synced_at = NOW() 
+                                WHERE id = ?
+                            ");
+                            $stmt->execute([$id]);
+                            $updated_sync++;
+                        } catch (Exception $e2) {
+                            logError("❌ ID $id synced qilishda xatolik: " . $e2->getMessage());
+                        }
+                    }
+                }
+            }
+            
+            $stats['synced'] = $updated_sync;
+            logSuccess("✅ $updated_sync ta IVMS yozuvi synced deb belgilandi");
+        }
+        
+        $executionTime = round(microtime(true) - $startTime, 2);
+        logSuccess("✅ Sync tugadi: " . $stats['inserted'] . " ta yozuv, " . $executionTime . " sek");
+        
+        return [
+            'status' => 'success',
+            'message' => 'Sync completed successfully',
+            'stats' => $stats,
+            'shift_stats' => [
+                'total' => $shiftStats['total'],
+                'night_shift_count' => $shiftStats['night_shift_count'],
+                'day_shift_count' => $shiftStats['day_shift_count'],
+                'no_schedule_count' => $shiftStats['no_schedule_count']
+            ],
+            'execution_time' => $executionTime,
+            'timestamp' => date('Y-m-d H:i:s')
+        ];
+        
+    } catch (Exception $e) {
+        $executionTime = round(microtime(true) - $startTime, 2);
+        logError("❌ Sync xatosi: " . $e->getMessage());
+        
+        return [
+            'status' => 'error',
+            'message' => $e->getMessage(),
+            'execution_time' => $executionTime,
+            'timestamp' => date('Y-m-d H:i:s')
+        ];
+    }
+}
+
+// ============================================================
+// 8. ASOSIY SINXRONIZATSIYA
+// ============================================================
+function runFullSync() {
+    global $fullLogFile;
+    
+    writeLogFile($fullLogFile, "🔄 FULL SYNC STARTED");
+    $result = syncAttendanceData();
+    writeLogFile($fullLogFile, "📊 Result: " . ($result['status'] ?? 'unknown'));
+    writeLogFile($fullLogFile, "✅ FULL SYNC COMPLETED");
+    
+    return $result;
+}
+
+// ============================================================
+// 9. AVTOMATIK ISHGA TUSHIRISH
+// ============================================================
+if (basename($_SERVER['PHP_SELF']) == 'sync_functions.php' && php_sapi_name() != 'cli') {
+    header('Content-Type: application/json');
+    
+    try {
+        $result = runFullSync();
+        echo json_encode($result, JSON_PRETTY_PRINT);
+    } catch (Exception $e) {
+        echo json_encode([
+            'status' => 'error',
+            'message' => $e->getMessage(),
+            'timestamp' => date('Y-m-d H:i:s')
+        ], JSON_PRETTY_PRINT);
+    }
+    exit;
+}
