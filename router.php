@@ -59,7 +59,7 @@ if (preg_match('#^/index\.php/([a-f0-9]{32})#', $uri, $m)) {
 // ============================================
 // 3) TAB YO'LLARI: /{tab}/{sid}  (masalan /employees/5cf3a53a...)
 // ============================================
-$allowedTabs = ['dashboard', 'employees', 'attendance', 'reports', 'settings', 'positions', 'branches', 'shifts'];
+$allowedTabs = ['dashboard', 'employees', 'attendance', 'reports', 'settings', 'positions', 'branches', 'shifts', 'excuses'];
 $tabPattern  = implode('|', $allowedTabs);
 
 if (preg_match('#^/(' . $tabPattern . ')/([a-f0-9]{32})/?$#', $uri, $m)) {

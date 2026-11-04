@@ -261,9 +261,10 @@ if (isset($_SESSION['account_name']) && $_SESSION['account_name'] === 'truthpos'
                 <?= $_t('hikvision_devices') ?>
             </a>
         <?php endif; ?>
-        <?php if (!$branchUser && $posterOwner): ?>
+        <a href="/excuses/<?= rawurlencode($_sid) ?>" class="nav-tab <?= $tab=='excuses' ? 'active' : '' ?>">Arizalar</a>
+        <?php if ($branchUser || $posterOwner): ?>
             <a href="/branches/<?= $_sid ?>" class="nav-tab <?= $tab=='branches' ? 'active' : '' ?>">
-                <?= $_t('branch_management') ?>
+                <?= $branchUser ? 'Mening filialim' : $_t('branch_management') ?>
             </a>
         <?php endif; ?>
     </div>

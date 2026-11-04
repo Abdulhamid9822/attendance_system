@@ -7,6 +7,7 @@ require_once __DIR__ . '/../../includes/functions/employee_classification.php';
 require_once __DIR__ . '/../../includes/functions/employee_filter_bar.php';
 require_once __DIR__ . '/../../includes/functions/employee.php';
 require_once __DIR__ . '/../../includes/functions/branch_access.php';
+require_once __DIR__ . '/../../includes/functions/excuses.php';
 
 global $pdo, $defaultSalary, $currencySymbol, $dateFrom, $dateTo, $currentLang;
 
@@ -767,8 +768,8 @@ function getDailySalarySetting($employeeId, $date, $monthlySettings) {
 // ============================================================
 // KECH KELISH JARIMASI
 // ============================================================
-function calculateLateArrivalPenalty($checkIn, $workStartTime, $monthlySettings) {
-    if (!$monthlySettings) return 0;
+function calculateLateArrivalPenalty($checkIn, $workStartTime, $monthlySettings, $excused = false) {
+    if ($excused || !$monthlySettings) return 0;
     
     $enabled = $monthlySettings['kech_kelish_jarima_enabled'] ?? 1;
     if(!$enabled || empty($checkIn) || empty($workStartTime)) return 0;
@@ -794,8 +795,8 @@ function calculateLateArrivalPenalty($checkIn, $workStartTime, $monthlySettings)
 // ============================================================
 // ERTA KETISH JARIMASI
 // ============================================================
-function calculateEarlyDeparturePenalty($checkOut, $workEndTime, $monthlySettings) {
-    if (!$monthlySettings) return 0;
+function calculateEarlyDeparturePenalty($checkOut, $workEndTime, $monthlySettings, $excused = false) {
+    if ($excused || !$monthlySettings) return 0;
     
     $enabled = $monthlySettings['erta_ketish_jarima_enabled'] ?? 1;
     if(!$enabled || empty($checkOut) || empty($workEndTime)) return 0;
@@ -956,12 +957,12 @@ function calculateDailySalary($employeeId, $date, $waitersData, $attendanceStatu
     $bonusTotal = 0;
     
     if($checkIn && $workSchedule && isset($workSchedule['start_time'])) {
-        $penaltyTotal += calculateLateArrivalPenalty($checkIn, $workSchedule['start_time'], $monthlySettings);
+        $penaltyTotal += calculateLateArrivalPenalty($checkIn, $workSchedule['start_time'], $monthlySettings, isExcused($employeeId, $date, 'late', $checkIn));
         $bonusTotal += calculateEarlyArrivalBonus($checkIn, $workSchedule['start_time'], $monthlySettings);
     }
     
     if($checkOut && $workSchedule && isset($workSchedule['end_time'])) {
-        $penaltyTotal += calculateEarlyDeparturePenalty($checkOut, $workSchedule['end_time'], $monthlySettings);
+        $penaltyTotal += calculateEarlyDeparturePenalty($checkOut, $workSchedule['end_time'], $monthlySettings, isExcused($employeeId, $date, 'early', $checkOut));
         $bonusTotal += calculateLateDepartureBonus($checkOut, $workSchedule['end_time'], $monthlySettings);
     }
     
@@ -1932,11 +1933,11 @@ foreach($employees as $key => $emp) {
                                            $dailyCalculationSettings, $dayWorkSchedule);
         
         if($checkIn && $dayWorkSchedule['start_time']) {
-            $totalLateArrivalPenalty += calculateLateArrivalPenalty($checkIn, $dayWorkSchedule['start_time'], $daySettings);
+            $totalLateArrivalPenalty += calculateLateArrivalPenalty($checkIn, $dayWorkSchedule['start_time'],             $daySettings, isExcused($empId, $date, 'late', $checkIn));
             $totalEarlyArrivalBonus += calculateEarlyArrivalBonus($checkIn, $dayWorkSchedule['start_time'], $daySettings);
         }
         if($checkOut && $dayWorkSchedule['end_time']) {
-            $totalEarlyDeparturePenalty += calculateEarlyDeparturePenalty($checkOut, $dayWorkSchedule['end_time'], $daySettings);
+            $totalEarlyDeparturePenalty += calculateEarlyDeparturePenalty($checkOut, $dayWorkSchedule['end_time'],             $daySettings, isExcused($empId, $date, 'early', $checkOut));
             $totalLateDepartureBonus += calculateLateDepartureBonus($checkOut, $dayWorkSchedule['end_time'], $daySettings);
         }
         
@@ -1946,8 +1947,8 @@ foreach($employees as $key => $emp) {
             'amount' => round($daySalary),
             'setting_date' => $dailySetting['setting_date'] ?? 'asosiy',
             'maosh_turi' => $daySettings['maosh_turi'] ?? 'fixed',
-            'late_arrival_penalty' => calculateLateArrivalPenalty($checkIn, $dayWorkSchedule['start_time'], $daySettings),
-            'early_departure_penalty' => calculateEarlyDeparturePenalty($checkOut, $dayWorkSchedule['end_time'], $daySettings),
+            'late_arrival_penalty' => calculateLateArrivalPenalty($checkIn, $dayWorkSchedule['start_time'], $daySettings, isExcused($empId, $date, 'late', $checkIn)),
+            'early_departure_penalty' => calculateEarlyDeparturePenalty($checkOut, $dayWorkSchedule['end_time'], $daySettings, isExcused($empId, $date, 'early', $checkOut)),
             'early_arrival_bonus' => calculateEarlyArrivalBonus($checkIn, $dayWorkSchedule['start_time'], $daySettings),
             'late_departure_bonus' => calculateLateDepartureBonus($checkOut, $dayWorkSchedule['end_time'], $daySettings)
         ];

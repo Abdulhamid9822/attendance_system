@@ -21,6 +21,7 @@ backup/
 uploads/
 images/
 config/database.php
+config/fcm-service-account.json
 config.php
 token.json
 credentials.json

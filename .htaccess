@@ -1,6 +1,7 @@
 <IfModule mod_rewrite.c>
     RewriteEngine On
     RewriteBase /
+    RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
     RewriteRule ^(?:includes|views|vendor|config|sessions|logs|cache|tmp|temp|backup)(?:/|$) - [F,L,NC]
     RewriteRule (^|/)\.(?!well-known(?:/|$)) - [F,L]
     RewriteRule ^(?:config\.php|config/|includes/config/|\.env(?:\..*)?|credentials\.json|token\.json|token_[^/]+\.txt|account_[^/]+\.txt|[^/]*\.(?:log|sql|sql\.gz|bak|bak2|save|phpt|pub)|manage\.php|check_speed\.php|test\.php|dashboard\.php|listening\.php|modules/(?:test|hikvision_sync|settings_ajax)\.php)$ - [F,L,NC]

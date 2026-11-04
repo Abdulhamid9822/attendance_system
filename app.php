@@ -264,9 +264,9 @@ foreach ($includes as $f) {
 // AKTIV TAB
 // ============================================
 $tab = preg_replace('/[^a-z_]/', '', $_GET['tab'] ?? 'dashboard');
-$allowedTabs = ['dashboard', 'employees', 'attendance', 'reports', 'settings', 'positions', 'branches', 'shifts'];
+$allowedTabs = ['dashboard', 'employees', 'attendance', 'reports', 'settings', 'positions', 'branches', 'shifts', 'excuses'];
 if (!in_array($tab, $allowedTabs)) $tab = 'dashboard';
-if (isBranchUser() && in_array($tab, ['positions', 'branches', 'shifts'], true)) {
+if (isBranchUser() && in_array($tab, ['positions', 'shifts'], true)) {
     http_response_code(403);
     exit('Ushbu bo‘lim faqat bosh administrator uchun.');
 }

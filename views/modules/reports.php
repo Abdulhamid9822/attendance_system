@@ -1048,6 +1048,7 @@ function getSettingsForDate($settingsHistory, $date) {
 // 6.9 CALCULATE EMPLOYEE SALARY
 // ============================================================
 function calculateEmployeeSalary($employeeId, $month, $monthlySettings, $attendanceData, $dailyWaitersRevenue) {
+    require_once __DIR__ . '/../../includes/functions/excuses.php';
     global $daysInMonth, $standardWorkHours, $currencySymbol;
 
     $settingsHistory = $monthlySettings[$employeeId] ?? null;
@@ -1196,7 +1197,7 @@ function calculateEmployeeSalary($employeeId, $month, $monthlySettings, $attenda
             }
 
             // KECH KELISH → JARIMA
-            if ($inLateMinutes > 0) {
+            if ($inLateMinutes > 0 && !isExcused($employeeId, $date, 'late', $checkIn)) {
                 $enabled = isset($settings['kech_kelish_jarima_enabled']) ? (int)$settings['kech_kelish_jarima_enabled'] : 1;
                 if ($enabled == 1) {
                     $perMinute = isset($settings['kech_kelish_jarima_per_minute']) ? (float)$settings['kech_kelish_jarima_per_minute'] : null;
@@ -1255,7 +1256,7 @@ function calculateEmployeeSalary($employeeId, $month, $monthlySettings, $attenda
             }
 
             // ERTA KETISH → JARIMA
-            if ($outEarlyMinutes < 0) {
+            if ($outEarlyMinutes < 0 && !isExcused($employeeId, $date, 'early', $checkOut)) {
                 $enabled = isset($settings['erta_ketish_jarima_enabled']) ? (int)$settings['erta_ketish_jarima_enabled'] : 1;
                 if ($enabled == 1) {
                     $earlyMinutes = abs($outEarlyMinutes);
@@ -1319,7 +1320,7 @@ function calculateEmployeeSalary($employeeId, $month, $monthlySettings, $attenda
             $inLateMinutes = (int)($att['in_late_minutes'] ?? 0);
             $workedHours = $att['total_work_hours'] ?? 0;
 
-            if ($inLateMinutes > 0) {
+            if ($inLateMinutes > 0 && !isExcused($employeeId, $date, 'late', $checkIn)) {
                 $enabled = isset($settings['kech_kelish_jarima_enabled']) ? (int)$settings['kech_kelish_jarima_enabled'] : 1;
                 if ($enabled == 1) {
                     $perMinute = isset($settings['kech_kelish_jarima_per_minute']) ? (float)$settings['kech_kelish_jarima_per_minute'] : null;
@@ -1358,7 +1359,7 @@ function calculateEmployeeSalary($employeeId, $month, $monthlySettings, $attenda
             $outEarlyMinutes = (int)($att['out_early_minutes'] ?? 0);
             $workedHours = $att['total_work_hours'] ?? 0;
 
-            if ($outEarlyMinutes < 0) {
+            if ($outEarlyMinutes < 0 && !isExcused($employeeId, $date, 'early', $checkOut)) {
                 $enabled = isset($settings['erta_ketish_jarima_enabled']) ? (int)$settings['erta_ketish_jarima_enabled'] : 1;
                 if ($enabled == 1) {
                     $earlyMinutes = abs($outEarlyMinutes);

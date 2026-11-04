@@ -1,7 +1,30 @@
 <?php
 require_once __DIR__ . '/../../includes/functions/branch_access.php';
 
-if (isBranchUser() || (int)($_SESSION['poster_user_type'] ?? -1) !== 90) {
+$isBranchAdmin = isBranchUser();
+$mySpot = currentBranchSpotId();
+
+// Filial admini boshqara oladigan mobil foydalanuvchi: o'z filiali admini yoki o'z filiali xodimi (super emas)
+function mobileUserInMyBranch(PDO $pdo, array $mobileUser, $accountName, $mySpot) {
+    if ($mobileUser['role'] === 'super') {
+        return false;
+    }
+    if ($mobileUser['role'] === 'branch') {
+        return (int)$mobileUser['spot_id'] === (int)$mySpot;
+    }
+    if (empty($mobileUser['xodim_id'])) {
+        return false;
+    }
+    $s = $pdo->prepare("SELECT 1 FROM xodimlar WHERE id = ? AND account_name = ? AND branch_spot_id = ? LIMIT 1");
+    $s->execute([(int)$mobileUser['xodim_id'], $accountName, (int)$mySpot]);
+    return (bool)$s->fetchColumn();
+}
+if ($isBranchAdmin) {
+    if ($mySpot <= 0) {
+        http_response_code(403);
+        exit('Filial ruxsati aniqlanmadi.');
+    }
+} elseif ((int)($_SESSION['poster_user_type'] ?? -1) !== 90) {
     http_response_code(403);
     exit('Filiallarni faqat Poster akkaunt egasi boshqarishi mumkin.');
 }
@@ -13,6 +36,16 @@ if ($accountName === '') {
 }
 
 ensureBranchAccessSchema($pdo);
+if ($isBranchAdmin) {
+    try {
+        assertBranchSessionActive($pdo);
+    } catch (RuntimeException $e) {
+        http_response_code(403);
+        exit($e->getMessage());
+    }
+}
+require_once __DIR__ . '/../../includes/functions/mobile_access.php';
+ensureMobileSchema($pdo);
 $currentPosterUserId = (int)($_SESSION['user_id'] ?? 0);
 if (empty($_SESSION['branch_admin_csrf'])) {
     $_SESSION['branch_admin_csrf'] = bin2hex(random_bytes(32));
@@ -34,9 +67,17 @@ if (isset($branchCatalogResponse['error'])) {
         }
     }
 }
-$posterEmployeeResponse = posterApi('access.getEmployees', [], $accountName, $_SESSION['access_token'] ?? '');
+if ($isBranchAdmin) {
+    $branchSpots = isset($branchSpots[$mySpot]) ? [$mySpot => $branchSpots[$mySpot]] : [$mySpot => t('spot') . ' ' . $mySpot];
+    $branchPageError = '';
+}
 $posterEmployeesWithAdminAccess = [];
 $branchEmployeeCatalogError = '';
+if ($isBranchAdmin) {
+    $posterEmployeeResponse = ['response' => []];
+} else {
+    $posterEmployeeResponse = posterApi('access.getEmployees', [], $accountName, $_SESSION['access_token'] ?? '');
+}
 if (isset($posterEmployeeResponse['error'])) {
     error_log('Branch employee access catalog request failed: ' . json_encode($posterEmployeeResponse['error']));
     $branchEmployeeCatalogError = t('branch_employee_catalog_error');
@@ -61,6 +102,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     } else {
         try {
             $action = (string)($_POST['branch_action'] ?? '');
+            $ownerOnlyActions = ['save_poster_manager', 'remove_poster_manager'];
+            if ($isBranchAdmin) {
+                assertBranchSessionActive($pdo);
+                if (in_array($action, $ownerOnlyActions, true)) {
+                    throw new RuntimeException('Bu amal faqat bosh administrator uchun.');
+                }
+            }
+            // Filial admini faqat o'z filiali yoki biriktirilmagan xodimlar bilan ishlaydi
+            $employeeScopeSql = $isBranchAdmin ? " AND (branch_spot_id IS NULL OR branch_spot_id = " . (int)$mySpot . ")" : '';
+            if ($isBranchAdmin && in_array($action, ['save_employee_branch', 'bulk_assign_employees'], true)) {
+                $targetSpot = (int)($_POST['branch_spot_id'] ?? 0);
+                if ($targetSpot !== 0 && $targetSpot !== $mySpot) {
+                    throw new RuntimeException('Faqat o\'z filialingizga biriktira olasiz.');
+                }
+            }
             if ($action === 'save_employee_branch') {
                 $employeeId = (int)($_POST['employee_id'] ?? 0);
                 $spotId = (int)($_POST['branch_spot_id'] ?? 0);
@@ -70,11 +126,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $stmt = $pdo->prepare("
                     UPDATE xodimlar
                     SET branch_spot_id = ?, poster_spot_id = ?
-                    WHERE id = ? AND account_name = ?
+                    WHERE id = ? AND account_name = ?{$employeeScopeSql}
                 ");
                 $stmt->execute([$spotId > 0 ? $spotId : null, $spotId > 0 ? $spotId : null, $employeeId, $accountName]);
                 if ($stmt->rowCount() === 0) {
-                    $check = $pdo->prepare("SELECT id FROM xodimlar WHERE id = ? AND account_name = ?");
+                    $check = $pdo->prepare("SELECT id FROM xodimlar WHERE id = ? AND account_name = ?{$employeeScopeSql}");
                     $check->execute([$employeeId, $accountName]);
                     if (!$check->fetchColumn()) {
                         throw new RuntimeException(t('employee_not_found'));
@@ -94,7 +150,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $stmt = $pdo->prepare("
                     UPDATE xodimlar
                     SET branch_spot_id = ?, poster_spot_id = ?
-                    WHERE account_name = ? AND holati != 'deleted' AND id IN ({$placeholders})
+                    WHERE account_name = ? AND holati != 'deleted' AND id IN ({$placeholders}){$employeeScopeSql}
                 ");
                 $stmt->execute(array_merge(
                     [$spotId > 0 ? $spotId : null, $spotId > 0 ? $spotId : null, $accountName],
@@ -139,6 +195,75 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new RuntimeException(t('branch_manager_not_found'));
                 }
                 $branchPageSuccess = t('branch_manager_removed');
+            } elseif ($action === 'save_mobile_access') {
+                $phone = normalizeMobilePhone($_POST['phone'] ?? '');
+                $pin = (string)($_POST['pin'] ?? '');
+                $role = (string)($_POST['role'] ?? 'employee');
+                $employeeId = (int)($_POST['employee_id'] ?? 0);
+                $spotId = (int)($_POST['spot_id'] ?? 0);
+                $allowedRoles = $isBranchAdmin ? ['employee', 'branch'] : ['employee', 'branch', 'super'];
+                if ($isBranchAdmin) {
+                    $spotId = $mySpot;
+                }
+                if ($phone === '' || !in_array($role, $allowedRoles, true)) {
+                    throw new InvalidArgumentException('Telefon raqami yoki rol noto\'g\'ri.');
+                }
+                if ($pin !== '' && !preg_match('/^\d{4,6}$/', $pin)) {
+                    throw new InvalidArgumentException('PIN 4-6 ta raqamdan iborat bo\'lishi kerak.');
+                }
+                $fullName = '';
+                if ($employeeId > 0) {
+                    $q = $pdo->prepare("SELECT ismi FROM xodimlar WHERE id = ? AND account_name = ?" . ($isBranchAdmin ? " AND branch_spot_id = " . (int)$mySpot : ''));
+                    $q->execute([$employeeId, $accountName]);
+                    $fullName = (string)$q->fetchColumn();
+                    if ($fullName === '') {
+                        throw new RuntimeException(t('employee_not_found'));
+                    }
+                }
+                if ($role === 'employee' && $employeeId <= 0) {
+                    throw new InvalidArgumentException('Xodim roli uchun xodimni tanlang.');
+                }
+                if ($role === 'branch' && ($spotId <= 0 || !isset($branchSpots[$spotId]))) {
+                    throw new InvalidArgumentException('Filial admini uchun filialni tanlang.');
+                }
+                $existing = $pdo->prepare("SELECT id, account_name, role, spot_id, xodim_id FROM mobile_users WHERE phone = ?");
+                $existing->execute([$phone]);
+                $row = $existing->fetch(PDO::FETCH_ASSOC);
+                if ($row && $row['account_name'] !== $accountName) {
+                    throw new InvalidArgumentException('Bu telefon raqami band.');
+                }
+                if ($row && $isBranchAdmin && !mobileUserInMyBranch($pdo, $row, $accountName, $mySpot)) {
+                    throw new InvalidArgumentException('Bu telefon raqami band.');
+                }
+                if (!$row && $pin === '') {
+                    throw new InvalidArgumentException('Yangi foydalanuvchi uchun PIN kiriting.');
+                }
+                $spotValue = $role === 'branch' ? $spotId : null;
+                $empValue = $employeeId > 0 ? $employeeId : null;
+                if ($row) {
+                    $sql = "UPDATE mobile_users SET xodim_id = ?, full_name = ?, role = ?, spot_id = ?, active = 1";
+                    $args = [$empValue, $fullName, $role, $spotValue];
+                    if ($pin !== '') {
+                        $sql .= ", pin_hash = ?, failed_attempts = 0, locked_until = NULL";
+                        $args[] = password_hash($pin, PASSWORD_DEFAULT);
+                    }
+                    $pdo->prepare($sql . " WHERE id = ?")->execute(array_merge($args, [$row['id']]));
+                } else {
+                    $pdo->prepare("INSERT INTO mobile_users (account_name, xodim_id, full_name, phone, pin_hash, role, spot_id) VALUES (?, ?, ?, ?, ?, ?, ?)")
+                        ->execute([$accountName, $empValue, $fullName, $phone, password_hash($pin, PASSWORD_DEFAULT), $role, $spotValue]);
+                }
+                $branchPageSuccess = 'Mobil ilova kirishi saqlandi.';
+            } elseif ($action === 'remove_mobile_access') {
+                $mobileId = (int)($_POST['mobile_id'] ?? 0);
+                $target = $pdo->prepare("SELECT id, account_name, role, spot_id, xodim_id FROM mobile_users WHERE id = ? AND account_name = ?");
+                $target->execute([$mobileId, $accountName]);
+                $targetRow = $target->fetch(PDO::FETCH_ASSOC);
+                if (!$targetRow || ($isBranchAdmin && !mobileUserInMyBranch($pdo, $targetRow, $accountName, $mySpot))) {
+                    throw new RuntimeException('Foydalanuvchi topilmadi.');
+                }
+                $pdo->prepare("DELETE FROM mobile_users WHERE id = ? AND account_name = ?")->execute([$mobileId, $accountName]);
+                $pdo->prepare("DELETE FROM mobile_tokens WHERE user_id = ?")->execute([$mobileId]);
+                $branchPageSuccess = 'Mobil ilova kirishi o\'chirildi.';
             } else {
                 throw new InvalidArgumentException(t('branch_unknown_action'));
             }
@@ -183,14 +308,29 @@ $pendingManagers = $pendingManagerStmt->fetchAll(PDO::FETCH_COLUMN);
 $employeeStmt = $pdo->prepare("
     SELECT id, ismi, branch_spot_id
     FROM xodimlar
-    WHERE account_name = ? AND holati = 'active'
+    WHERE account_name = ? AND holati = 'active'" . ($isBranchAdmin ? " AND (branch_spot_id IS NULL OR branch_spot_id = " . (int)$mySpot . ")" : '') . "
     ORDER BY ismi
 ");
 $employeeStmt->execute([$accountName]);
 $branchEmployees = $employeeStmt->fetchAll(PDO::FETCH_ASSOC);
+$mobileStmt = $pdo->prepare("SELECT id, xodim_id, full_name, phone, role, spot_id FROM mobile_users WHERE account_name = ? ORDER BY role, full_name");
+$mobileStmt->execute([$accountName]);
+$mobileUsers = $mobileStmt->fetchAll(PDO::FETCH_ASSOC);
+if ($isBranchAdmin) {
+    $mobileUsers = array_values(array_filter($mobileUsers, function ($mu) use ($pdo, $accountName, $mySpot) {
+        return mobileUserInMyBranch($pdo, $mu, $accountName, $mySpot);
+    }));
+}
+$mobileRoleLabels = ['employee' => 'Xodim', 'branch' => 'Filial admini', 'super' => 'Super admin'];
+if ($isBranchAdmin) {
+    unset($mobileRoleLabels['super']);
+}
 
 $managersBySpot = [];
 foreach ($branchManagers as $manager) {
+    if ($isBranchAdmin && (int)$manager['spot_id'] !== $mySpot) {
+        continue;
+    }
     $managersBySpot[(int)$manager['spot_id']][] = (int)$manager['poster_user_id'];
 }
 $employeeCountBySpot = [];
@@ -264,6 +404,14 @@ $managerName = static function ($posterUserId) use ($posterEmployeesWithAdminAcc
     .ba td.check, .ba th.check { width: 40px; text-align: center; }
     .ba td select { min-width: 200px; }
     .ba-saving { opacity: .55; pointer-events: none; }
+    .ba-tabs { display: flex; gap: 4px; margin-bottom: 18px; padding: 4px; background: #f1f5f9; border-radius: 12px; overflow-x: auto; }
+    .ba-tab { flex: 1 1 auto; display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 9px 16px; border: 0; border-radius: 9px; background: transparent; color: #64748b; font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+    .ba-tab:hover { color: #0f172a; }
+    .ba-tab.active { background: #fff; color: #1d4ed8; box-shadow: 0 1px 3px rgba(15, 23, 42, .12); }
+    .ba-tab .ba-badge { background: #e2e8f0; color: #475569; }
+    .ba-tab.active .ba-badge { background: #dbeafe; color: #1d4ed8; }
+    .ba-pane { display: none; }
+    .ba-pane.active { display: block; }
     @media (max-width: 860px) {
         .ba { padding: 14px; }
         .ba-stats { grid-template-columns: repeat(2, 1fr); }
@@ -274,8 +422,8 @@ $managerName = static function ($posterUserId) use ($posterEmployeesWithAdminAcc
 
 <main class="ba">
     <div class="ba-head">
-        <h2><?= t('branch_management') ?></h2>
-        <p><?= t('branch_management_description') ?></p>
+        <h2><?= $isBranchAdmin ? 'Mening filialim' : t('branch_management') ?></h2>
+        <p><?= $isBranchAdmin ? 'Faqat o\'z filialingiz: xodimlarni biriktirish va mobil ilova kirishlari.' : t('branch_management_description') ?></p>
     </div>
 
     <?php if ($branchPageError !== ''): ?><div class="ba-msg error"><?= $h($branchPageError) ?></div><?php endif; ?>
@@ -285,11 +433,18 @@ $managerName = static function ($posterUserId) use ($posterEmployeesWithAdminAcc
 
     <div class="ba-stats">
         <div class="ba-stat"><b><?= count($branchSpots) ?></b><span>Filiallar</span></div>
-        <div class="ba-stat"><b><?= count($branchManagers) ?></b><span>Filial adminlari</span></div>
+        <div class="ba-stat"><b><?= $isBranchAdmin ? count($managersBySpot[$mySpot] ?? []) : count($branchManagers) ?></b><span>Filial adminlari</span></div>
         <div class="ba-stat"><b><?= count($branchEmployees) - $unassignedCount ?></b><span>Biriktirilgan xodimlar</span></div>
         <div class="ba-stat <?= $unassignedCount > 0 ? 'warn' : '' ?>"><b><?= $unassignedCount ?></b><span>Biriktirilmagan xodimlar</span></div>
     </div>
 
+    <div class="ba-tabs" role="tablist">
+        <button type="button" class="ba-tab active" data-tab="admins" role="tab">Filiallar va adminlar <span class="ba-badge"><?= count($branchSpots) ?></span></button>
+        <button type="button" class="ba-tab" data-tab="employees" role="tab">Xodimlarni biriktirish <?php if ($unassignedCount > 0): ?><span class="ba-badge warn"><?= $unassignedCount ?></span><?php endif; ?></button>
+        <button type="button" class="ba-tab" data-tab="mobile" role="tab">Mobil ilova <span class="ba-badge"><?= count($mobileUsers) ?></span></button>
+    </div>
+
+    <div class="ba-pane active" data-pane="admins">
     <section class="ba-card">
         <div class="ba-card-head"><h3>Filiallar va adminlar</h3></div>
         <div class="ba-card-body">
@@ -305,12 +460,14 @@ $managerName = static function ($posterUserId) use ($posterEmployeesWithAdminAcc
                             <?php foreach ($managersBySpot[$spotId] as $managerId): ?>
                                 <span class="ba-chip">
                                     <?= $h($managerName($managerId)) ?>
+                                    <?php if (!$isBranchAdmin): ?>
                                     <form method="POST" onsubmit="return confirm('Adminni olib tashlaysizmi?');">
                                         <input type="hidden" name="csrf_token" value="<?= $h($branchAdminCsrf) ?>">
                                         <input type="hidden" name="branch_action" value="remove_poster_manager">
                                         <input type="hidden" name="poster_user_id" value="<?= (int)$managerId ?>">
                                         <button type="submit" title="<?= $h(t('delete')) ?>">&times;</button>
                                     </form>
+                                    <?php endif; ?>
                                 </span>
                             <?php endforeach; ?>
                         <?php else: ?>
@@ -322,6 +479,7 @@ $managerName = static function ($posterUserId) use ($posterEmployeesWithAdminAcc
         </div>
     </section>
 
+    <?php if (!$isBranchAdmin): ?>
     <section class="ba-card">
         <div class="ba-card-head"><h3>Filial adminini tayinlash</h3></div>
         <div class="ba-card-body">
@@ -374,7 +532,10 @@ $managerName = static function ($posterUserId) use ($posterEmployeesWithAdminAcc
             <?php endif; ?>
         </div>
     </section>
+    <?php endif; ?>
+    </div>
 
+    <div class="ba-pane" data-pane="employees">
     <section class="ba-card">
         <div class="ba-card-head">
             <h3><?= t('branch_employee_assignment') ?></h3>
@@ -439,7 +600,83 @@ $managerName = static function ($posterUserId) use ($posterEmployeesWithAdminAcc
             </table>
         </div>
     </section>
+    </div>
+
+    <div class="ba-pane" data-pane="mobile">
+    <section class="ba-card">
+        <div class="ba-card-head"><h3>Mobil ilova kirishlari</h3></div>
+        <div class="ba-card-body">
+            <p class="ba-empty" style="margin:0 0 12px;">Kirish: telefon raqam + PIN (4-6 raqam). Mavjud foydalanuvchini o'zgartirish uchun xuddi shu telefonni kiriting; PIN bo'sh qolsa o'zgarmaydi.</p>
+            <form method="POST" class="ba-row" style="grid-template-columns: 1fr 1fr 1fr 1fr 110px auto;">
+                <input type="hidden" name="csrf_token" value="<?= $h($branchAdminCsrf) ?>">
+                <input type="hidden" name="branch_action" value="save_mobile_access">
+                <div class="ba-field"><label>Telefon</label><input type="text" name="phone" placeholder="90 123 45 67" required></div>
+                <div class="ba-field"><label>Rol</label>
+                    <select name="role"><?php foreach ($mobileRoleLabels as $rk => $rl): ?><option value="<?= $rk ?>"><?= $h($rl) ?></option><?php endforeach; ?></select>
+                </div>
+                <div class="ba-field"><label>Xodim</label>
+                    <select name="employee_id"><option value="0">—</option>
+                        <?php foreach ($branchEmployees as $employee): ?><option value="<?= (int)$employee['id'] ?>"><?= $h($employee['ismi']) ?></option><?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="ba-field"><label>Filial (filial admini uchun)</label>
+                    <select name="spot_id"><option value="0">—</option>
+                        <?php foreach ($branchSpots as $spotId => $spotName): ?><option value="<?= (int)$spotId ?>"><?= $h($spotName) ?></option><?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="ba-field"><label>PIN</label><input type="text" name="pin" inputmode="numeric" maxlength="6" autocomplete="off"></div>
+                <button type="submit" class="ba-btn">Saqlash</button>
+            </form>
+            <?php if ($mobileUsers !== []): ?>
+                <div class="ba-table-wrap" style="margin-top:16px;">
+                    <table>
+                        <thead><tr><th>Ism</th><th>Telefon</th><th>Rol</th><th>Filial</th><th></th></tr></thead>
+                        <tbody>
+                        <?php foreach ($mobileUsers as $mu): ?>
+                            <tr>
+                                <td><?= $h($mu['full_name'] !== '' ? $mu['full_name'] : '—') ?></td>
+                                <td>+998 <?= $h($mu['phone']) ?></td>
+                                <td><span class="ba-badge"><?= $h($mobileRoleLabels[$mu['role']] ?? $mu['role']) ?></span></td>
+                                <td><?= $mu['spot_id'] ? $h($branchSpots[(int)$mu['spot_id']] ?? $mu['spot_id']) : '—' ?></td>
+                                <td>
+                                    <form method="POST" onsubmit="return confirm('O\'chirilsinmi?');">
+                                        <input type="hidden" name="csrf_token" value="<?= $h($branchAdminCsrf) ?>">
+                                        <input type="hidden" name="branch_action" value="remove_mobile_access">
+                                        <input type="hidden" name="mobile_id" value="<?= (int)$mu['id'] ?>">
+                                        <button type="submit" class="ba-btn ghost">O'chirish</button>
+                                    </form>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            <?php endif; ?>
+        </div>
+    </section>
+    </div>
 </main>
+
+<script>
+(function () {
+    var tabs = Array.prototype.slice.call(document.querySelectorAll('.ba-tab'));
+    var panes = Array.prototype.slice.call(document.querySelectorAll('.ba-pane'));
+    var KEY = 'baActiveTab';
+
+    function showTab(name) {
+        if (!panes.some(function (p) { return p.getAttribute('data-pane') === name; })) { name = 'admins'; }
+        tabs.forEach(function (t) { t.classList.toggle('active', t.getAttribute('data-tab') === name); });
+        panes.forEach(function (p) { p.classList.toggle('active', p.getAttribute('data-pane') === name); });
+        try { sessionStorage.setItem(KEY, name); } catch (e) {}
+    }
+    tabs.forEach(function (t) {
+        t.addEventListener('click', function () { showTab(t.getAttribute('data-tab')); });
+    });
+    var saved = 'admins';
+    try { saved = sessionStorage.getItem(KEY) || 'admins'; } catch (e) {}
+    showTab(saved);
+})();
+</script>
 
 <script>
 (function () {
